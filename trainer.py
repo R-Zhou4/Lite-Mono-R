@@ -15,6 +15,10 @@ from layers import *
 import datasets
 import networks
 from linear_warmup_cosine_annealing_warm_restarts_weight_decay import ChainedScheduler
+from datasets.single_image_dataset import SingleImageDataset
+import glob
+from torchvision import transforms
+
 
 
 # torch.backends.cudnn.benchmark = True
@@ -141,31 +145,67 @@ class Trainer:
         print("Training is using:\n  ", self.device)
 
         # data
-        datasets_dict = {"kitti": datasets.KITTIRAWDataset,
-                         "kitti_odom": datasets.KITTIOdomDataset}
-        self.dataset = datasets_dict[self.opt.dataset]
+        if self.opt.dataset == "single_image":
 
-        fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
+            # 光度抖动 + 翻转 + ToTensor
+            transform = transforms.Compose([
+                transforms.ColorJitter(brightness=0.2, contrast=0.2,
+                                       saturation=0.2, hue=0.1),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor()
+            ])
+            img_ext = '.png' if self.opt.png else '.jpg'
+            img_paths = sorted(glob.glob(os.path.join(self.opt.data_path, f"*{img_ext}")))
+            num_train_samples = len(img_paths)
+            self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
 
-        train_filenames = readlines(fpath.format("train"))
-        val_filenames = readlines(fpath.format("val"))
-        img_ext = '.png' if self.opt.png else '.jpg'
+            train_dataset = SingleImageDataset(
+                img_list=img_paths,
+                intrinsics=self.opt.K,
+                transform=transform
+            )
+            self.train_loader = DataLoader(
+                train_dataset, self.opt.batch_size, True,
+                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True
+            )
+            self.val_loader = DataLoader(
+                train_dataset, self.opt.batch_size, False,
+                num_workers=self.opt.num_workers, pin_memory=True, drop_last=False
+            )
+        else:
+            datasets_dict = {
+                "kitti":      datasets.KITTIRAWDataset,
+                "kitti_odom": datasets.KITTIOdomDataset
+            }
+            self.dataset = datasets_dict[self.opt.dataset]
+            fpath = os.path.join(os.path.dirname(__file__),
+                                 "splits", self.opt.split, "{}_files.txt")
+            train_filenames = readlines(fpath.format("train"))
+            val_filenames   = readlines(fpath.format("val"))
+            img_ext = '.png' if self.opt.png else '.jpg'
+            num_train_samples = len(train_filenames)
+            self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
 
-        num_train_samples = len(train_filenames)
-        self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
-
-        train_dataset = self.dataset(
-            self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
-        self.train_loader = DataLoader(
-            train_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
-        val_dataset = self.dataset(
-            self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=False, img_ext=img_ext)
-        self.val_loader = DataLoader(
-            val_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            train_dataset = self.dataset(
+                self.opt.data_path, train_filenames,
+                self.opt.height, self.opt.width,
+                self.opt.frame_ids, 4,
+                is_train=True, img_ext=img_ext
+            )
+            self.train_loader = DataLoader(
+                train_dataset, self.opt.batch_size, True,
+                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True
+            )
+            val_dataset = self.dataset(
+                self.opt.data_path, val_filenames,
+                self.opt.height, self.opt.width,
+                self.opt.frame_ids, 4,
+                is_train=False, img_ext=img_ext
+            )
+            self.val_loader = DataLoader(
+                val_dataset, self.opt.batch_size, True,
+                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True
+            )
         self.val_iter = iter(self.val_loader)
 
         self.writers = {}
@@ -701,4 +741,3 @@ class Trainer:
             self.model_pose_optimizer.load_state_dict(optimizer_pose_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
-
