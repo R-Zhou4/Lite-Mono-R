@@ -1,17 +1,14 @@
 from __future__ import absolute_import, division, print_function
 
-
 import time
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
 import json
-
 from utils import *
 from kitti_utils import *
 from layers import *
-
 import datasets
 import networks
 from linear_warmup_cosine_annealing_warm_restarts_weight_decay import ChainedScheduler
@@ -19,11 +16,7 @@ from datasets.single_image_dataset import SingleImageDataset
 import glob
 from torchvision import transforms
 
-
-
 # torch.backends.cudnn.benchmark = True
-
-
 def time_sync():
     # PyTorch-accurate time
     if torch.cuda.is_available():
@@ -36,7 +29,6 @@ class Trainer:
         self.opt = options
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
 
-        # checking height and width are multiples of 32
         assert self.opt.height % 32 == 0, "'height' must be a multiple of 32"
         assert self.opt.width % 32 == 0, "'width' must be a multiple of 32"
 
@@ -49,26 +41,29 @@ class Trainer:
         self.profile = self.opt.profile
 
         self.num_scales = len(self.opt.scales)
-        self.frame_ids = len(self.opt.frame_ids)
-        self.num_pose_frames = 2 if self.opt.pose_model_input == "pairs" else self.num_input_frames
+        self.frame_ids = self.opt.frame_ids
+        self.num_frame_ids = len(self.opt.frame_ids)
+        self.num_pose_frames = 2 if self.opt.pose_model_input == "pairs" else self.num_frame_ids
 
-        assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
+        assert self.frame_ids[0] == 0, "frame_ids must start with 0"
 
-        self.use_pose_net = not (self.opt.use_stereo and self.opt.frame_ids == [0])
-
+        self.use_pose_net = not (self.opt.use_stereo and self.frame_ids == [0])
         if self.opt.use_stereo:
-            self.opt.frame_ids.append("s")
+            self.frame_ids.append("s")
 
-        self.models["encoder"] = networks.LiteMono(model=self.opt.model,
-                                                   drop_path_rate=self.opt.drop_path,
-                                                   width=self.opt.width, height=self.opt.height)
-
-        self.models["encoder"].to(self.device)
+        # 初始化模型
+        self.models["encoder"] = networks.LiteMono(
+            model=self.opt.model,
+            drop_path_rate=self.opt.drop_path,
+            width=self.opt.width,
+            height=self.opt.height
+        ).to(self.device)
         self.parameters_to_train += list(self.models["encoder"].parameters())
 
-        self.models["depth"] = networks.DepthDecoder(self.models["encoder"].num_ch_enc,
-                                                     self.opt.scales)
-        self.models["depth"].to(self.device)
+        self.models["depth"] = networks.DepthDecoder(
+            self.models["encoder"].num_ch_enc,
+            self.opt.scales
+        ).to(self.device)
         self.parameters_to_train += list(self.models["depth"].parameters())
 
         if self.use_pose_net:
@@ -76,166 +71,162 @@ class Trainer:
                 self.models_pose["pose_encoder"] = networks.ResnetEncoder(
                     self.opt.num_layers,
                     self.opt.weights_init == "pretrained",
-                    num_input_images=self.num_pose_frames)
-
-                self.models_pose["pose_encoder"].to(self.device)
+                    num_input_images=self.num_pose_frames
+                ).to(self.device)
                 self.parameters_to_train_pose += list(self.models_pose["pose_encoder"].parameters())
 
                 self.models_pose["pose"] = networks.PoseDecoder(
                     self.models_pose["pose_encoder"].num_ch_enc,
                     num_input_features=1,
-                    num_frames_to_predict_for=2)
+                    num_frames_to_predict_for=2
+                ).to(self.device)
 
             elif self.opt.pose_model_type == "shared":
                 self.models_pose["pose"] = networks.PoseDecoder(
-                    self.models["encoder"].num_ch_enc, self.num_pose_frames)
+                    self.models["encoder"].num_ch_enc,
+                    self.num_pose_frames
+                ).to(self.device)
 
             elif self.opt.pose_model_type == "posecnn":
                 self.models_pose["pose"] = networks.PoseCNN(
-                    self.num_input_frames if self.opt.pose_model_input == "all" else 2)
+                    self.num_pose_frames if self.opt.pose_model_input == "all" else 2
+                ).to(self.device)
 
-            self.models_pose["pose"].to(self.device)
             self.parameters_to_train_pose += list(self.models_pose["pose"].parameters())
 
-        if self.opt.predictive_mask:
-            assert self.opt.disable_automasking, \
-                "When using predictive_mask, please disable automasking with --disable_automasking"
-
-            # Our implementation of the predictive masking baseline has the the same architecture
-            # as our depth decoder. We predict a separate mask for each source frame.
-            self.models["predictive_mask"] = networks.DepthDecoder(
-                self.models["encoder"].num_ch_enc, self.opt.scales,
-                num_output_channels=(len(self.opt.frame_ids) - 1))
-            self.models["predictive_mask"].to(self.device)
-            self.parameters_to_train += list(self.models["predictive_mask"].parameters())
-
-        self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.lr[0], weight_decay=self.opt.weight_decay)
+        # 初始化优化器
+        self.model_optimizer = optim.AdamW(
+            self.parameters_to_train, self.opt.lr[0], weight_decay=self.opt.weight_decay
+        )
         if self.use_pose_net:
-            self.model_pose_optimizer = optim.AdamW(self.parameters_to_train_pose, self.opt.lr[3], weight_decay=self.opt.weight_decay)
+            self.model_pose_optimizer = optim.AdamW(
+                self.parameters_to_train_pose, self.opt.lr[3], weight_decay=self.opt.weight_decay
+            )
 
         self.model_lr_scheduler = ChainedScheduler(
-                            self.model_optimizer,
-                            T_0=int(self.opt.lr[2]),
-                            T_mul=1,
-                            eta_min=self.opt.lr[1],
-                            last_epoch=-1,
-                            max_lr=self.opt.lr[0],
-                            warmup_steps=0,
-                            gamma=0.9
-                        )
-        self.model_pose_lr_scheduler = ChainedScheduler(
-            self.model_pose_optimizer,
-            T_0=int(self.opt.lr[5]),
+            self.model_optimizer,
+            T_0=int(self.opt.lr[2]),
             T_mul=1,
-            eta_min=self.opt.lr[4],
+            eta_min=self.opt.lr[1],
             last_epoch=-1,
-            max_lr=self.opt.lr[3],
+            max_lr=self.opt.lr[0],
             warmup_steps=0,
             gamma=0.9
         )
+        if self.use_pose_net:
+            self.model_pose_lr_scheduler = ChainedScheduler(
+                self.model_pose_optimizer,
+                T_0=int(self.opt.lr[5]),
+                T_mul=1,
+                eta_min=self.opt.lr[4],
+                last_epoch=-1,
+                max_lr=self.opt.lr[3],
+                warmup_steps=0,
+                gamma=0.9
+            )
 
-        if self.opt.load_weights_folder is not None:
+        if self.opt.load_weights_folder:
             self.load_model()
 
-        if self.opt.mypretrain is not None:
+        if self.opt.mypretrain:
             self.load_pretrain()
 
         print("Training model named:\n  ", self.opt.model_name)
-        print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
+        print("Models and tensorboard events files are saved to:\n  ", self.opt.log_path)
         print("Training is using:\n  ", self.device)
 
-        # data
-        if self.opt.dataset == "single_image":
+        img_ext = '.png' if self.opt.png else '.jpg'
+        val_dataset = None  # 防止后面打印时报错
 
-            # 光度抖动 + 翻转 + ToTensor
+        # ====== Dataset 部分处理 ======
+        if self.opt.dataset == "single_image":
             transform = transforms.Compose([
                 transforms.ColorJitter(brightness=0.2, contrast=0.2,
-                                       saturation=0.2, hue=0.1),
+                               saturation=0.2, hue=0.1),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor()
             ])
-            img_ext = '.png' if self.opt.png else '.jpg'
-            img_paths = sorted(glob.glob(os.path.join(self.opt.data_path, f"*{img_ext}")))
-            num_train_samples = len(img_paths)
-            self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
-
+    
+            single_image_path = sorted(glob.glob(os.path.join(self.opt.data_path, "*.jpg")))[0]
+    
             train_dataset = SingleImageDataset(
-                img_list=img_paths,
-                intrinsics=self.opt.K,
-                transform=transform
+              img_path=single_image_path,
+              intrinsics=self.opt.K,
+              transform=transform,
+              repeat=1000  # 你可以自己调，比如1000次
             )
-            self.train_loader = DataLoader(
-                train_dataset, self.opt.batch_size, True,
-                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True
-            )
-            self.val_loader = DataLoader(
-                train_dataset, self.opt.batch_size, False,
-                num_workers=self.opt.num_workers, pin_memory=True, drop_last=False
-            )
+            val_dataset = train_dataset  # 用相同数据验证
+
+            self.train_loader = DataLoader(train_dataset, self.opt.batch_size, True,
+                                   num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            self.val_loader = DataLoader(val_dataset, self.opt.batch_size, False,
+                                 num_workers=self.opt.num_workers, pin_memory=True, drop_last=False)
         else:
             datasets_dict = {
-                "kitti":      datasets.KITTIRAWDataset,
+                "kitti": datasets.KITTIRAWDataset,
                 "kitti_odom": datasets.KITTIOdomDataset
             }
             self.dataset = datasets_dict[self.opt.dataset]
-            fpath = os.path.join(os.path.dirname(__file__),
-                                 "splits", self.opt.split, "{}_files.txt")
+            fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
             train_filenames = readlines(fpath.format("train"))
-            val_filenames   = readlines(fpath.format("val"))
-            img_ext = '.png' if self.opt.png else '.jpg'
-            num_train_samples = len(train_filenames)
-            self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
+            val_filenames = readlines(fpath.format("val"))
 
             train_dataset = self.dataset(
                 self.opt.data_path, train_filenames,
                 self.opt.height, self.opt.width,
-                self.opt.frame_ids, 4,
-                is_train=True, img_ext=img_ext
+                self.frame_ids, 4, is_train=True, img_ext=img_ext
             )
-            self.train_loader = DataLoader(
-                train_dataset, self.opt.batch_size, True,
-                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True
-            )
+
             val_dataset = self.dataset(
                 self.opt.data_path, val_filenames,
                 self.opt.height, self.opt.width,
-                self.opt.frame_ids, 4,
-                is_train=False, img_ext=img_ext
+                self.frame_ids, 4, is_train=False, img_ext=img_ext
             )
-            self.val_loader = DataLoader(
-                val_dataset, self.opt.batch_size, True,
-                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True
-            )
+
+        self.train_loader = DataLoader(
+            train_dataset,
+            self.opt.batch_size,
+            shuffle=True,
+            num_workers=self.opt.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        self.val_loader = DataLoader(
+            val_dataset,
+            self.opt.batch_size,
+            shuffle=False,
+            num_workers=self.opt.num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
         self.val_iter = iter(self.val_loader)
 
+        # 记录器
         self.writers = {}
         for mode in ["train", "val"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
         if not self.opt.no_ssim:
-            self.ssim = SSIM()
-            self.ssim.to(self.device)
+            self.ssim = SSIM().to(self.device)
 
         self.backproject_depth = {}
         self.project_3d = {}
         for scale in self.opt.scales:
             h = self.opt.height // (2 ** scale)
             w = self.opt.width // (2 ** scale)
-
-            self.backproject_depth[scale] = BackprojectDepth(self.opt.batch_size, h, w)
-            self.backproject_depth[scale].to(self.device)
-
-            self.project_3d[scale] = Project3D(self.opt.batch_size, h, w)
-            self.project_3d[scale].to(self.device)
+            self.backproject_depth[scale] = BackprojectDepth(self.opt.batch_size, h, w).to(self.device)
+            self.project_3d[scale] = Project3D(self.opt.batch_size, h, w).to(self.device)
 
         self.depth_metric_names = [
-            "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
+            "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"
+        ]
 
         print("Using split:\n  ", self.opt.split)
         print("There are {:d} training items and {:d} validation items\n".format(
             len(train_dataset), len(val_dataset)))
 
         self.save_opts()
+
 
     def set_train(self):
         """Convert all models to training mode
