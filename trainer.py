@@ -8,10 +8,9 @@ import json
 from utils import *
 from kitti_utils import *
 from layers import *
-import datasets
 import networks
 from linear_warmup_cosine_annealing_warm_restarts_weight_decay import ChainedScheduler
-from single_image_dataset import SingleImageDataset  # 确保导入 SingleImageDataset
+from datasets.single_image_dataset import SingleImageDataset
 
 def time_sync():
     if torch.cuda.is_available():
@@ -29,6 +28,7 @@ class Trainer:
 
         self.models = {}
         self.models_pose = {}
+        self.opt.frame_ids = [0]  # 单张图片训练只用 frame_id = 0
         self.parameters_to_train = []
         self.parameters_to_train_pose = []
 
@@ -41,11 +41,13 @@ class Trainer:
 
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
 
-        self.use_pose_net = not (self.opt.use_stereo and self.opt.frame_ids == [0])
+        # 禁用姿势网络（已正确）
+        self.use_pose_net = False
 
         if self.opt.use_stereo:
             self.opt.frame_ids.append("s")
 
+        # 深度网络
         self.models["encoder"] = networks.LiteMono(model=self.opt.model,
                                                    drop_path_rate=self.opt.drop_path,
                                                    width=self.opt.width, height=self.opt.height)
@@ -57,6 +59,8 @@ class Trainer:
         self.models["depth"].to(self.device)
         self.parameters_to_train += list(self.models["depth"].parameters())
 
+        # 注释姿势网络（已正确）
+        """
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
                 self.models_pose["pose_encoder"] = networks.ResnetEncoder(
@@ -79,6 +83,7 @@ class Trainer:
 
             self.models_pose["pose"].to(self.device)
             self.parameters_to_train_pose += list(self.models_pose["pose"].parameters())
+        """
 
         if self.opt.predictive_mask:
             assert self.opt.disable_automasking, \
@@ -89,20 +94,26 @@ class Trainer:
             self.models["predictive_mask"].to(self.device)
             self.parameters_to_train += list(self.models["predictive_mask"].parameters())
 
-        self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.lr[0], weight_decay=self.opt.weight_decay)
+        # 优化器（修复 lr 为标量）
+        lr = self.opt.lr[0] if isinstance(self.opt.lr, list) else self.opt.lr
+        self.model_optimizer = optim.AdamW(self.parameters_to_train, lr, weight_decay=self.opt.weight_decay)
+
+        # 学习率调度（保持上次修改）
+        self.model_lr_scheduler = ChainedScheduler(
+            self.model_optimizer,
+            T_0=100,
+            T_mul=1,
+            eta_min=1e-6,
+            last_epoch=-1,
+            max_lr=lr,
+            warmup_steps=0,
+            gamma=0.9
+        )
+
+        # 删除姿势网络优化器和调度器（已正确）
+        """
         if self.use_pose_net:
             self.model_pose_optimizer = optim.AdamW(self.parameters_to_train_pose, self.opt.lr[3], weight_decay=self.opt.weight_decay)
-
-        self.model_lr_scheduler = ChainedScheduler(
-                            self.model_optimizer,
-                            T_0=int(self.opt.lr[2]),
-                            T_mul=1,
-                            eta_min=self.opt.lr[1],
-                            last_epoch=-1,
-                            max_lr=self.opt.lr[0],
-                            warmup_steps=0,
-                            gamma=0.9
-                        )
         self.model_pose_lr_scheduler = ChainedScheduler(
             self.model_pose_optimizer,
             T_0=int(self.opt.lr[5]),
@@ -113,7 +124,9 @@ class Trainer:
             warmup_steps=0,
             gamma=0.9
         )
+        """
 
+        # 以下保持不变
         if self.opt.load_weights_folder is not None:
             self.load_model()
 
@@ -204,30 +217,30 @@ class Trainer:
             late_phase = self.step % 2000 == 0
             if early_phase or late_phase:
                 self.log_time(batch_idx, duration, losses["loss"].cpu().data)
-                if "depth_gt" in inputs:
-                    self.compute_depth_losses(inputs, outputs, losses)
                 self.log("train", inputs, outputs, losses)
-                self.val()
+                if self.step % 1000 == 0:
+                    self.val()
             self.step += 1
 
     def process_batch(self, inputs):
         for key, ipt in inputs.items():
             inputs[key] = ipt.to(self.device)
-        if self.opt.pose_model_type == "shared":
-            all_color_aug = torch.cat([inputs[("color_aug", i, 0)] for i in self.opt.frame_ids])
-            all_features = self.models["encoder"](all_color_aug)
-            all_features = [torch.split(f, self.opt.batch_size) for f in all_features]
-            features = {}
-            for i, k in enumerate(self.opt.frame_ids):
-                features[k] = [f[i] for f in all_features]
-            outputs = self.models["depth"](features[0])
-        else:
-            features = self.models["encoder"](inputs["color_aug", 0, 0])
-            outputs = self.models["depth"](features)
+        
+        # 单张图片训练，直接用 ("color", 0, 0)
+        features = self.models["encoder"](inputs[("color", 0, 0)])
+        outputs = self.models["depth"](features)
+        
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
+        
+        # 禁用姿势预测（use_pose_net = False）
         if self.use_pose_net:
             outputs.update(self.predict_poses(inputs, features))
+        
+        for scale in [0]:  # 只处理 scale = 0
+            outputs[("disp", scale)] = outputs[("disp", scale)]
+            
+        # 跳过多帧生成（单张图片无需重投影）
         self.generate_images_pred(inputs, outputs)
         losses = self.compute_losses(inputs, outputs)
         return outputs, losses
@@ -274,10 +287,10 @@ class Trainer:
     def val(self):
         self.set_eval()
         try:
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
         except StopIteration:
             self.val_iter = iter(self.val_loader)
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
         with torch.no_grad():
             outputs, losses = self.process_batch(inputs)
             if "depth_gt" in inputs:
@@ -287,40 +300,17 @@ class Trainer:
         self.set_train()
 
     def generate_images_pred(self, inputs, outputs):
-        for scale in self.opt.scales:
-            disp = outputs[("disp", scale)]
-            if self.opt.v1_multiscale:
-                source_scale = scale
-            else:
-                disp = F.interpolate(
-                    disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
-                source_scale = 0
-            _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
-            outputs[("depth", 0, scale)] = depth
-            for i, frame_id in enumerate(self.opt.frame_ids[1:]):
-                if frame_id == "s":
-                    T = inputs["stereo_T"]
-                else:
-                    T = outputs[("cam_T_cam", 0, frame_id)]
-                if self.opt.pose_model_type == "posecnn":
-                    axisangle = outputs[("axisangle", 0, frame_id)]
-                    translation = outputs[("translation", 0, frame_id)]
-                    inv_depth = 1 / depth
-                    mean_inv_depth = inv_depth.mean(3, True).mean(2, True)
-                    T = transformation_from_parameters(
-                        axisangle[:, 0], translation[:, 0] * mean_inv_depth[:, 0], frame_id < 0)
-                cam_points = self.backproject_depth[source_scale](
-                    depth, inputs[("inv_K", source_scale)])
-                pix_coords = self.project_3d[source_scale](
-                    cam_points, inputs[("K", source_scale)], T)
-                outputs[("sample", frame_id, scale)] = pix_coords
-                outputs[("color", frame_id, scale)] = F.grid_sample(
-                    inputs[("color", frame_id, source_scale)],
-                    outputs[("sample", frame_id, scale)],
-                    padding_mode="border", align_corners=True)
-                if not self.opt.disable_automasking:
-                    outputs[("color_identity", frame_id, scale)] = \
-                        inputs[("color", frame_id, source_scale)]
+    # 单张图片训练，只生成深度图，scale = 0
+      scale = 0
+      disp = outputs[("disp", scale)]
+      if self.opt.v1_multiscale:
+          source_scale = scale
+      else:
+          disp = F.interpolate(
+              disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
+          source_scale = 0
+      _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
+      outputs[("depth", 0, scale)] = depth
 
     def compute_reprojection_loss(self, pred, target):
         abs_diff = torch.abs(target - pred)
@@ -335,95 +325,52 @@ class Trainer:
     def compute_losses(self, inputs, outputs):
         losses = {}
         total_loss = 0
-        for scale in self.opt.scales:
-            loss = 0
-            reprojection_losses = []
-            if self.opt.v1_multiscale:
-                source_scale = scale
-            else:
-                source_scale = 0
-            disp = outputs[("disp", scale)]
-            color = inputs[("color", 0, scale)]
-            target = inputs[("color", 0, source_scale)]
-            for frame_id in self.opt.frame_ids[1:]:
-                pred = outputs[("color", frame_id, scale)]
-                reprojection_losses.append(self.compute_reprojection_loss(pred, target))
-            reprojection_losses = torch.cat(reprojection_losses, 1)
-            if not self.opt.disable_automasking:
-                identity_reprojection_losses = []
-                for frame_id in self.opt.frame_ids[1:]:
-                    pred = inputs[("color", frame_id, source_scale)]
-                    identity_reprojection_losses.append(
-                        self.compute_reprojection_loss(pred, target))
-                identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
-                if self.opt.avg_reprojection:
-                    identity_reprojection_loss = identity_reprojection_losses.mean(1, keepdim=True)
-                else:
-                    identity_reprojection_loss = identity_reprojection_losses
-            elif self.opt.predictive_mask:
-                mask = outputs["predictive_mask"]["disp", scale]
-                if not self.opt.v1_multiscale:
-                    mask = F.interpolate(
-                        mask, [self.opt.height, self.opt.width],
-                        mode="bilinear", align_corners=False)
-                reprojection_losses *= mask
-                weighting_loss = 0.2 * nn.BCELoss()(mask, torch.ones(mask.shape).cuda())
-                loss += weighting_loss.mean()
-            if self.opt.avg_reprojection:
-                reprojection_loss = reprojection_losses.mean(1, keepdim=True)
-            else:
-                reprojection_loss = reprojection_losses
-            if not self.opt.disable_automasking:
-                identity_reprojection_loss += torch.randn(
-                    identity_reprojection_loss.shape, device=self.device) * 0.00001
-                combined = torch.cat((identity_reprojection_loss, reprojection_loss), dim=1)
-            else:
-                combined = reprojection_loss
-            if combined.shape[1] == 1:
-                to_optimise = combined
-            else:
-                to_optimise, idxs = torch.min(combined, dim=1)
-            if not self.opt.disable_automasking:
-                outputs["identity_selection/{}".format(scale)] = (
-                    idxs > identity_reprojection_loss.shape[1] - 1).float()
-            loss += to_optimise.mean()
-            mean_disp = disp.mean(2, True).mean(3, True)
-            norm_disp = disp / (mean_disp + 1e-7)
-            smooth_loss = get_smooth_loss(norm_disp, color)
-            loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
-            total_loss += loss
-            losses["loss/{}".format(scale)] = loss
-        total_loss /= self.num_scales
+        
+        # 单张图片训练，只用 scale = 0
+        scale = 0
+        loss = 0
+        disp = outputs[("disp", scale)]
+        color = inputs[("color", 0, scale)]
+        
+        # 计算平滑损失
+        mean_disp = disp.mean(2, True).mean(3, True)
+        norm_disp = disp / (mean_disp + 1e-7)
+        smooth_loss = get_smooth_loss(norm_disp, color)
+        loss += self.opt.disparity_smoothness * smooth_loss
+        
+        total_loss += loss
+        losses["loss/{}".format(scale)] = loss
+        
         losses["loss"] = total_loss
         return losses
 
-    def compute_depth_losses(self, inputs, outputs, losses):
-        depth_pred = outputs[("depth", 0, 0)]
-        depth_pred = torch.clamp(F.interpolate(
-            depth_pred, [375, 1242], mode="bilinear", align_corners=False), 1e-3, 80)
-        depth_pred = depth_pred.detach()
-        depth_gt = inputs["depth_gt"]
-        mask = depth_gt > 0
-        crop_mask = torch.zeros_like(mask)
-        crop_mask[:, :, 153:371, 44:1197] = 1
-        mask = mask * crop_mask
-        depth_gt = depth_gt[mask]
-        depth_pred = depth_pred[mask]
-        depth_pred *= torch.median(depth_gt) / torch.median(depth_pred)
-        depth_pred = torch.clamp(depth_pred, min=1e-3, max=80)
-        depth_errors = compute_depth_errors(depth_gt, depth_pred)
-        for i, metric in enumerate(self.depth_metric_names):
-            losses[metric] = np.array(depth_errors[i].cpu())
-
+    def compute_losses(self, inputs, outputs):
+      losses = {}
+      total_loss = 0
+      scale = 0
+      loss = 0
+      disp = outputs[("disp", scale)]
+      color = inputs[("color", 0, scale)]
+      mean_disp = disp.mean(2, True).mean(3, True)
+      norm_disp = disp / (mean_disp + 1e-7)
+      smooth_loss = get_smooth_loss(norm_disp, color)
+      disp_l2_loss = torch.mean(disp ** 2)  # 新增 L2 损失
+      loss += self.opt.disparity_smoothness * smooth_loss
+      loss += 0.01 * disp_l2_loss  # 防止视差过小
+      total_loss += loss
+      losses["loss/{}".format(scale)] = loss
+      losses["loss"] = total_loss
+      print(f"smooth_loss: {smooth_loss.item()}, disp_l2_loss: {disp_l2_loss.item()}, total_loss: {total_loss.item()}")
+      return losses
+ 
     def log_time(self, batch_idx, duration, loss):
         samples_per_sec = self.opt.batch_size / duration
         time_sofar = time.time() - self.start_time
         training_time_left = (
             self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
-        print_string = "epoch {:>3} | lr {:.6f} |lr_p {:.6f} | batch {:>6} | examples/s: {:5.1f}" + \
+        print_string = "epoch {:>3} | lr {:.6f} | batch {:>6} | examples/s: {:5.1f}" + \
             " | loss: {:.5f} | time elapsed: {} | time left: {}"
         print(print_string.format(self.epoch, self.model_optimizer.state_dict()['param_groups'][0]['lr'],
-                                  self.model_pose_optimizer.state_dict()['param_groups'][0]['lr'],
                                   batch_idx, samples_per_sec, loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
@@ -432,28 +379,14 @@ class Trainer:
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
         for j in range(min(4, self.opt.batch_size)):
-            for s in self.opt.scales:
-                for frame_id in self.opt.frame_ids:
-                    writer.add_image(
-                        "color_{}_{}/{}".format(frame_id, s, j),
-                        inputs[("color", frame_id, s)][j].data, self.step)
-                    if s == 0 and frame_id != 0:
-                        writer.add_image(
-                            "color_pred_{}_{}/{}".format(frame_id, s, j),
-                            outputs[("color", frame_id, s)][j].data, self.step)
-                writer.add_image(
-                    "disp_{}/{}".format(s, j),
-                    normalize_image(outputs[("disp", s)][j]), self.step)
-                if self.opt.predictive_mask:
-                    for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
-                        writer.add_image(
-                            "predictive_mask_{}_{}/{}".format(frame_id, s, j),
-                            outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
-                            self.step)
-                elif not self.opt.disable_automasking:
-                    writer.add_image(
-                        "automask_{}/{}".format(s, j),
-                        outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
+            scale = 0  # 单张图片只用 scale = 0
+            frame_id = 0  # 只记录当前帧
+            writer.add_image(
+                "color_{}_{}/{}".format(frame_id, scale, j),
+                inputs[("color", frame_id, scale)][j].data, self.step)
+            writer.add_image(
+                "disp_{}/{}".format(scale, j),
+                normalize_image(outputs[("disp", scale)][j]), self.step)
 
     def save_opts(self):
         models_dir = os.path.join(self.log_path, "models")
